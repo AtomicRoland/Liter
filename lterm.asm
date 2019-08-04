@@ -1,14 +1,14 @@
 \ Linux Terminal for Acorn Atom
 
-incAtmHeader		= 1			    \ INCLUDE ATM HEADER FOR ATOMMC2 FILE
+incAtmHeader		= 0			    \ INCLUDE ATM HEADER FOR ATOMMC2 FILE
 debug			    = 1			    \ IF debug THEN PRINT SOME ADDITIONAL MESSAGES
 
-LOADEXEC            = $3000         \ LOAD ADDRESS OF PROGRAM
+LOADEXEC            = $0500         \ LOAD ADDRESS OF PROGRAM
 OSRDCH			    = $FFE3			\ READ CHARACTER ROUTINE
 OSWRCH			    = $FFF4			\ PRINT CHARACTER ROUTINE
 OSNEWL			    = $FFED			\ PRINT NEWLINE
 KEYSCAN			    = $FE71			\ KEYBOARD SCAN ROUTINE
-WAIT                = $FB8A         \ SHORT WAIT
+WAIT                = $FB8C         \ SHORT WAIT
 
 SERIALSTATUS        = $BDB1         \ UART STATUS / CONTROL REGISTER
 SERIALDATA          = $BDB0         \ UART DATA REGISTER
@@ -19,14 +19,25 @@ PORTC               = $B002         \ C-PORT OF THE 8255 (for rept key)
 
 LEDCTRL             = $BFE0         \ CONTROL REGISTER FOR LED STATUS
 LEDDATA             = $BFE1         \ DATA REGISTER FOR LED STATUS
+CTRLREG             = $BFFE         \ GENERIC CONTROL REGISTER
+
+via_t1_latch        = $B804
+via_acr             = $B80B
+via_ier             = $B80E
 
 ZP      			= $84			\ A FEW BYTES FOR WORKSPACE
 LOCKSTATUS          = $E7           \ STATUS OF CAPS LOCK KEY
 IRQVEC              = $204          \ INTERRUPT VECTOR
 
-BUFFER              = $4000         \ INPUT BUFFER
+BUFFER              = $1800         \ INPUT BUFFER
 RXPTR               = $80           \ RX POINTER
 WRPTR               = $82           \ WRITE POINTER
+
+\ Timer setting
+\ At 115,200 baud there is a character receveived every 86,8 usec. The ISR takes about 100 cpu cycles.
+\ With the Atom running at 8 MHz we can do this ISR in about 12.5 usec. If we don't want to miss an interrupt
+\ we should sample at about 43 usec (Shannon's Sample Theorem :-) So the timer must be set to 40 * 8 = 320.
+int_interval        = 320           \ every 40 usec interrupt, sufficient for 115,200 baud with Atom running at 8 MHz
 
 IF (incAtmHeader)
 		            ORG LOADEXEC - 22
@@ -43,18 +54,33 @@ ENDIF
 \ Initialization
 \ This routine sets up the serial interface and the interrupts
     
-.INIT               LDA     #<SERIALSPEED   \ SET THE BAUD RATE
+.INIT               LDA     CTRLREG         \ SWITCH TO 8 MHZ
+                    ORA     #$60
+                    STA     CTRLREG
+
+                    LDA     #<SERIALSPEED   \ SET THE BAUD RATE
                     STA     SERIALDIVIDER
                     LDA     #>SERIALSPEED
                     STA     SERIALDIVIDER + 1
 
                     SEI                     \ DISABLE INTERRUPTS
-                    LDA     #<SERIALISR     \ INITIALIZE INTERRUPTS
+                    LDA     #<new_intvec    \ INITIALIZE INTERRUPTS
                     STA     IRQVEC
-                    LDA     #>SERIALISR
+                    LDA     #>new_intvec
                     STA     IRQVEC + 1
-                    LDA     #$21            \ ACTIVATE ONLY RX INTERRUPT
-                    STA     SERIALSTATUS
+
+                    lda     #$c0                \ timer1 geeft int
+                    sta     via_ier
+
+                    lda     via_acr
+                    ora     #$c0                \ free running mode
+                    sta     via_acr
+    
+                    lda     #<int_interval      \ zet interval tijd int
+                    sta     via_t1_latch
+                    lda     #>int_interval
+                    sta     via_t1_latch + 1
+        
                     CLI                     \ ENABLE INTERRUPTS
 
                     LDA     #$00            \ CLEAR CAPS LOCK FLAG
@@ -82,8 +108,10 @@ ENDIF
                     LDA     WRPTR+1
                     CMP     RXPTR+1
                     BNE     LOOP2           \ YES, THERE IS SO JUMP
+                    JSR     BUFLEDOFF       \ DIM LED AS THERE IS NO DATA
                     JMP     LOOP0           \ START ALL OVER (NO DATA IN BUFFER)
-.LOOP2              LDY     #0              \ CLEAR INDEX REGISTER
+.LOOP2              JSR     BUFLEDON        \ SET LED TO INDICATE BUFFER DATA
+                    LDY     #0              \ CLEAR INDEX REGISTER
                     LDA     (WRPTR),Y       \ LOAD DATA TO PRINT
                     JSR     OSWRCH          \ PRINT CHARACTER
                     INC     WRPTR           \ INCREMENT WRITE POINTER
@@ -107,7 +135,8 @@ ENDIF
                   \ JSR     WAIT            \ WAIT A SHORT WHILE
                   \ JSR     KEYSCAN         \ SCAN AGAIN (TO AVOID BOUNCING KEYS)
                   \ BCS     ENDGETKEY       \ IF NO KEY IS PRESSED THEN END
-                    JSR     WAIT            \ WAIT A SHORT WHILE
+                    LDX     #12             \ WAIT A SHORT WHILE
+                    JSR     WAIT      
                     JMP     KEY2ASCII       \ GET THE ASCII VALUE OF THE KEY AND RETURN TO MAIN LOOP
 .ENDGETKEY          LDA     #$00            \ LOAD ZERO CHARACTER TO INDICATE NO KEY PRESSED
                     RTS                     \ RETURN TO MAIN LOOP
@@ -162,6 +191,33 @@ ENDIF
 .SERIALEND          PLA                     \ RESTORE ACCUMULATOR
                     RTI                     \ END OF INTERRUPT
 
+.new_intvec
+                    lda via_t1_latch        \ 4     4
+                    lda SERIALSTATUS        \ 4     4
+                    and #2                  \ 2     2
+                    beq return              \ 2     3
+                    tya                     \ 2
+                    pha                     \ 3
+                    jsr RXLEDON             \ 16
+                    ldy #0                  \ 2
+                    LDA     SERIALDATA      \ 4         LOAD RECEIVED DATA
+                    STA     (RXPTR),Y       \ 6         STORE DATA IN BUFFER
+                    INC     RXPTR           \ 5         INCREMENT POINTER
+                    BNE     nocarry         \ 2
+                    INC     RXPTR + 1       \ 5
+                    BPL     nocarry         \ 2         JUMP IF END OF BUFFER NOT REACHED
+                    LDA     #<BUFFER        \ 2         RESET THE POINTER
+                    STA     RXPTR           \ 3
+                    LDA     #>BUFFER        \ 2
+                    STA     RXPTR+1         \ 3
+.nocarry
+                    jsr RXLEDOFF            \ 16
+                    pla                     \ 4
+                    tay                     \ 2
+.return
+                    pla                     \ 4     4
+                    rti                     \ 6     6
+                                            \ ~100  23
 
 .RXLEDON            LDA     LEDDATA         \ LOAD CURRENT DATA
                     ORA     #$01            \ SET BIT
@@ -178,6 +234,14 @@ ENDIF
 
 .TXLEDOFF           LDA     LEDDATA         \ LOAD CURRENT DATA
                     AND     #$FD            \ CLEAR BIT
+                    JMP     SETLED          \ SET LED AND RETURN
+
+.BUFLEDON           LDA     LEDDATA         \ LOAD CURRENT DATA
+                    ORA     #$04            \ SET BIT
+                    JMP     SETLED          \ SET LED AND RETURN
+
+.BUFLEDOFF          LDA     LEDDATA         \ LOAD CURRENT DATA
+                    AND     #$FB            \ CLEAR BIT
                     JMP     SETLED          \ SET LED AND RETURN
 
 .CAPSLEDON          LDA     LEDDATA         \ LOAD CURRENT DATA
@@ -313,11 +377,11 @@ ENDIF
                     EQUB    '*'             \ SCAN CODE $1A, :*
                     EQUB    '+'             \ SCAN CODE $1B, ;+
                     EQUB    '<'             \ SCAN CODE $1C, ,<
-                    EQUB    '-'             \ SCAN CODE $1D, -=
+                    EQUB    '='             \ SCAN CODE $1D, -=
                     EQUB    '>'             \ SCAN CODE $1E, .>
                     EQUB    '?'             \ SCAN CODE $1F, /?
 
-                    EQUB    $60             \ SCAN CODE $20, @
+                    EQUB    '@'             \ SCAN CODE $20, @
                     EQUB    'A'             \ SCAN CODE $21, A
                     EQUB    'B'             \ SCAN CODE $22, B
                     EQUB    'C'             \ SCAN CODE $23, C
