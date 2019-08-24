@@ -1,9 +1,9 @@
 \ Linux Terminal for Acorn Atom
 
-incAtmHeader		= 0			    \ INCLUDE ATM HEADER FOR ATOMMC2 FILE
+incAtmHeader		= 1			    \ INCLUDE ATM HEADER FOR ATOMMC2 FILE
 debug			    = 1			    \ IF debug THEN PRINT SOME ADDITIONAL MESSAGES
 
-LOADEXEC            = $0500         \ LOAD ADDRESS OF PROGRAM
+LOADEXEC            = $9C00         \ LOAD ADDRESS OF PROGRAM
 OSRDCH			    = $FFE3			\ READ CHARACTER ROUTINE
 OSWRCH			    = $FFF4			\ PRINT CHARACTER ROUTINE
 OSNEWL			    = $FFED			\ PRINT NEWLINE
