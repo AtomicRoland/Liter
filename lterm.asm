@@ -1,5 +1,15 @@
 \ Linux Terminal for Acorn Atom
 
+\ LED indicators:
+\ Led 0   RX DATA     Data receive from Raspi
+\ Led 1   TX DATA     Data send to Raspi
+\ Led 2   RX BUFFER   RX Buffer (input) contains data
+\ Led 3   TX BUFFER   TX Buffer (output) contains data
+\ Led 4
+\ Led 5
+\ Led 6
+\ Led 7   CAPS LOCK   Caps lock status (0 = off, 1 = on)
+
 incAtmHeader		= 1			    \ INCLUDE ATM HEADER FOR ATOMMC2 FILE
 debug			    = 1			    \ IF debug THEN PRINT SOME ADDITIONAL MESSAGES
 
@@ -14,6 +24,18 @@ SERIALSTATUS        = $BDB1         \ UART STATUS / CONTROL REGISTER
 SERIALDATA          = $BDB0         \ UART DATA REGISTER
 SERIALDIVIDER       = $BDB2         \ UART BAUD RATE REGISTER
 SERIALSPEED         = $0045         \ CLOCK DIVIDER SERIAL INTERFACE (115k2)
+
+UART                = $BFC8
+UART_RHR            = UART + 0
+UART_THR            = UART + 0
+UART_DLL            = UART + 0
+UART_DLM            = UART + 1
+UART_LCR            = UART + 3
+UART_LSR            = UART + 5
+UART_MSR            = UART + 6
+UART_DIVISOR        = $01
+UART_PROTOCOL       = $03           \ 8 BITS, NO PARITY, 1 STOP BIT
+
 PORTB               = $B001         \ B-PORT OF THE 8255 (for shift and ctrl key)
 PORTC               = $B002         \ C-PORT OF THE 8255 (for rept key)
 
@@ -25,11 +47,15 @@ via_t1_latch        = $B804
 via_acr             = $B80B
 via_ier             = $B80E
 
-ZP      			= $84			\ A FEW BYTES FOR WORKSPACE
+KEYRDPTR            = $84           \ KEYBOARD READ POINTER
+KEYWRPTR            = $85           \ KEYBOARD WRITE POINTER
+ZP      			= $86			\ A FEW BYTES FOR WORKSPACE
 LOCKSTATUS          = $E7           \ STATUS OF CAPS LOCK KEY
 IRQVEC              = $204          \ INTERRUPT VECTOR
+SCAN80INIT          = $0603         \ INITIALISATION ROUTINE FOR ANSI KEYBOARD READ
 
-BUFFER              = $1800         \ INPUT BUFFER
+INPUTBUF            = $580          \ KEYBOARD (output) BUFFER
+BUFFER              = $1800         \ RX DATA (input) BUFFER
 RXPTR               = $80           \ RX POINTER
 WRPTR               = $82           \ WRITE POINTER
 
@@ -58,36 +84,25 @@ ENDIF
                     ORA     #$60
                     STA     CTRLREG
 
-                    LDA     #<SERIALSPEED   \ SET THE BAUD RATE
-                    STA     SERIALDIVIDER
-                    LDA     #>SERIALSPEED
-                    STA     SERIALDIVIDER + 1
+                    LDA     #$80            \ SELECT DIVISOR REGISTERS
+                    STA     UART_LCR
+                    LDA     #<UART_DIVISOR  \ SET THE BAUD RATE
+                    STA     UART_DLL
+                    LDA     #>UART_DIVISOR
+                    STA     UART_DLM
+                    LDA     #UART_PROTOCOL   \ LOAD PROTOCOL
+                    STA     UART_LCR
 
-                    SEI                     \ DISABLE INTERRUPTS
-                    LDA     #<new_intvec    \ INITIALIZE INTERRUPTS
-                    STA     IRQVEC
-                    LDA     #>new_intvec
-                    STA     IRQVEC + 1
 
-                    lda     #$c0                \ timer1 geeft int
-                    sta     via_ier
+\                   JSR     SERIAL_SETUP    \ SETUP INTERRUPTS FROM SERIAL INTERFACE
+                    JSR     VIA_SETUP       \ SETUP INTERRUPTS FROM VIA
 
-                    lda     via_acr
-                    ora     #$c0                \ free running mode
-                    sta     via_acr
-    
-                    lda     #<int_interval      \ zet interval tijd int
-                    sta     via_t1_latch
-                    lda     #>int_interval
-                    sta     via_t1_latch + 1
-        
-                    CLI                     \ ENABLE INTERRUPTS
+\                    LDA     #$00            \ CLEAR CAPS LOCK FLAG
+\                    STA     LOCKSTATUS
+\                    STA     LEDCTRL         \ SELECT LED MODE
+\                    STA     LEDDATA         \ CLEAR ALL LEDS
 
-                    LDA     #$00            \ CLEAR CAPS LOCK FLAG
-                    STA     LOCKSTATUS
-                    STA     LEDCTRL         \ SELECT LED MODE
-                    STA     LEDDATA         \ CLEAR ALL LEDS
-
+                    JSR     SCAN80INIT      \ INIT ANSI KEYBOARD READ ROUTINE
                     LDA     #<BUFFER        \ SET RX AND WR POINTERS
                     STA     RXPTR
                     STA     WRPTR
@@ -98,9 +113,10 @@ ENDIF
 \ The main loop.
 \ This loop checks if a key is pressed; if a key is pressed it will be send via the serial interface. Received
 \ bytes will be handled by the interrupt service routine.
-.LOOP0              JSR     GETKEY          \ SCAN THE KEYBOARD
-                    CMP     #0              \ TEST IF KEY PRESSED
-                    BEQ     LOOP1           \ JUMP IF NO KEY IS PRESSED
+.LOOP0              JSR     OSRDCH          \ SCAN THE KEYBOARD
+                    JSR     GETKEYBUF       \ READ DATA FROM KEYBOARD BUFFER
+                    CMP     #0              \ TEST IF KEYBOARD DATA PRESENT
+                    BEQ     LOOP1           \ JUMP IF NO DATA
                     JSR     SENDKEY         \ TRANSMIT THE ASCII VALUE OF THE KEY
 .LOOP1              LDA     WRPTR           \ CHECK IF THERE IS ANY DATA IN THE RECEIVE BUFFER
                     CMP     RXPTR           \ 
@@ -142,16 +158,31 @@ ENDIF
                     RTS                     \ RETURN TO MAIN LOOP
                     
 
+\ Read a key from the input buffer
+.GETKEYBUF          LDY     KEYRDPTR        \ LOAD KEYBOARD READ BUFFER POINTER
+                    CPY     KEYWRPTR        \ COMPARE TO KEYBOARD WRITE BUFFER POINTER
+                    BEQ     KBUFEMPTY       \ JUMP IF INPUT BUFFER IS EMPTY
+                    LDA     INPUTBUF,Y      \ READ DATA
+                    INY                     \ INCREMENT READ BUFFER POINTER
+                    BPL     GETKEYBUF1      \ JUMP IF NOT END OF BUFFER IS REACHED
+                    LDY     #0              \ RESET THE READ POINTER
+.GETKEYBUF1         STY     KEYRDPTR        \ STORE NEW POINTER VALUE
+                    RTS                     \ RETURN TO MAIN LOOP
+.KBUFEMPTY          JSR     KEYLEDOFF       \ TURN INPUT BUFFER LED OFF
+                    LDA     #0              \ NO DATA
+                    RTS                     \ RETURN TO MAIN LOOP
+    
+
 \ Send key through serial interface
 \ This routine sends the value in A through the serial interface.
                     
 .SENDKEY            PHA                     \ SAVE THE DATA
                     JSR     TXLEDON         \ SET TX LED ON
-.SENDKEY1           LDA     SERIALSTATUS    \ CHECK IF THE OUTPUT BUFFER IS EMPTY
-                    AND     #$01            \ MASK THE OUTPUT BUFFER BIT
+.SENDKEY1           LDA     UART_LSR        \ CHECK IF THE OUTPUT BUFFER IS EMPTY
+                    AND     #$20            \ MASK THE OUTPUT BUFFER BIT
                     BEQ     SENDKEY1        \ IF NOT EMPTY, KEEP WAITING
                     PLA                     \ RESTORE THE DATA
-                    STA     SERIALDATA      \ SEND THE DATA
+                    STA     UART_THR        \ SEND THE DATA
                     JSR     TXLEDOFF        \ SET TX LED OFF
                     RTS                     \ RETURN TO MAIN LOOP
 
@@ -160,11 +191,21 @@ ENDIF
 \ This routine checks if a byte is received by the serial interface. If it has, it will read it and return
 \ this byte in A. If no byte is received, A will be $00.
 
-.RECEIVE            LDA     SERIALSTATUS    \ READ THE STATUS REGISTER
-                    AND     #$02            \ MASK THE INPUT BUFFER BIT
+.RECEIVE            LDA     UART_LSR        \ READ THE STATUS REGISTER
+                    AND     #$01            \ MASK THE INPUT BUFFER BIT
                     BEQ     RECEIVE1        \ NO CHARACTER RECEIVED ( A = $00)
-                    LDA     SERIALDATA      \ READ THE RECEIVED DATA
+                    LDA     UART_RHR        \ READ THE RECEIVED DATA
 .RECEIVE1           RTS                     \ RETURN TO MAIN LOOP
+
+.SERIAL_SETUP       SEI                     \ DISABLE INTERRUPTS
+                    LDA     #<SERIALISR     \ INITIALIZE INTERRUPTS
+                    STA     IRQVEC
+                    LDA     #>SERIALISR
+                    STA     IRQVEC + 1
+                    LDA     #$20            \ LOAD INTERRUPT CONTROL FOR SERIAL INTERFACE
+                    STA     SERIALSTATUS    \ ENABLE RX INTERRUPT
+                    CLI                     \ ENABLE INTERRUPTS
+                    RTS
 
 .SERIALISR          LDA     SERIALSTATUS    \ READ STATUS REGISTER
                     AND     #$08            \ TEST RX INTERRUPT
@@ -178,7 +219,7 @@ ENDIF
                     INC     RXPTR           \ INCREMENT POINTER
                     BNE     SERIALISR1
                     INC     RXPTR + 1
-                    BPL     SERIALISR1      \ JUMP IF END OF BUFFER NOT REACHED
+                    BPL     SERIALISR1      \ JUMP IF END OF BUFFER NOT REACHED (i.e. #8000)
                     LDA     #<BUFFER        \ RESET THE POINTER
                     STA     RXPTR
                     LDA     #>BUFFER
@@ -191,16 +232,33 @@ ENDIF
 .SERIALEND          PLA                     \ RESTORE ACCUMULATOR
                     RTI                     \ END OF INTERRUPT
 
-.new_intvec
+.VIA_SETUP          SEI                     \ DISABLE INTERRUPTS
+                    LDA     #<VIA_INTVEC    \ INITIALIZE INTERRUPTS
+                    STA     IRQVEC
+                    LDA     #>VIA_INTVEC
+                    STA     IRQVEC+1
+                    lda     #$c0            \ enable timer1 interrupts
+                    sta     via_ier
+                    lda     via_acr         \ free running mode
+                    ora     #$c0            
+                    sta     via_acr
+                    lda     #<int_interval  \ zet interval tijd int
+                    sta     via_t1_latch
+                    lda     #>int_interval
+                    sta     via_t1_latch+1
+                    CLI                     \ ENABLE INTERRUPTS
+                    RTS
+
+.VIA_INTVEC
                     lda via_t1_latch        \ 4     4
-                    lda SERIALSTATUS        \ 4     4
-                    and #2                  \ 2     2
+                    lda UART_LSR            \ 4     4
+                    and #1                  \ 2     2
                     beq return              \ 2     3
                     tya                     \ 2
                     pha                     \ 3
                     jsr RXLEDON             \ 16
                     ldy #0                  \ 2
-                    LDA     SERIALDATA      \ 4         LOAD RECEIVED DATA
+                    LDA     UART_RHR        \ 4         LOAD RECEIVED DATA
                     STA     (RXPTR),Y       \ 6         STORE DATA IN BUFFER
                     INC     RXPTR           \ 5         INCREMENT POINTER
                     BNE     nocarry         \ 2
@@ -242,6 +300,14 @@ ENDIF
 
 .BUFLEDOFF          LDA     LEDDATA         \ LOAD CURRENT DATA
                     AND     #$FB            \ CLEAR BIT
+                    JMP     SETLED          \ SET LED AND RETURN
+
+.KEYLEDON           LDA     LEDDATA         \ LOAD CURRENT DATA
+                    ORA     #$08            \ SET BIT
+                    JMP     SETLED          \ SET LED AND RETURN
+
+.KEYLEDOFF          LDA     LEDDATA         \ LOAD CURRENT DATA
+                    AND     #$F7            \ CLEAR BIT
                     JMP     SETLED          \ SET LED AND RETURN
 
 .CAPSLEDON          LDA     LEDDATA         \ LOAD CURRENT DATA
